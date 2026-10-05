@@ -1,0 +1,156 @@
+name: Build proxy IPA
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - "Tweak.x"
+      - "Makefile"
+      - "control"
+      - "FlameProxy.plist"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: "Optional: direct URL of the base IPA (otherwise uses repo variable IPA_URL, ipa/app.ipa, or the base-ipa release)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-latest
+    env:
+      # Optional sources for the base (TikTok) IPA. Empty on push runs unless the
+      # repository variable IPA_URL (Settings > Secrets and variables > Actions > Variables) is set.
+      IPA_URL: ${{ inputs.ipa_url || vars.IPA_URL }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          lfs: true
+
+      - name: Install Theos
+        uses: Randomblock1/theos-action@v1
+
+      # ---------- 1. Build the tweak with Theos ----------
+      - name: Build tweak (make clean / make)
+        run: |
+          set -e
+          make clean
+          make FINALPACKAGE=1
+
+      - name: Collect build outputs
+        run: |
+          set -e
+          mkdir -p build output
+          DYLIB=$(find .theos -name "FlameProxy.dylib" -type f | head -n 1)
+          if [ -z "$DYLIB" ]; then
+            echo "::error::FlameProxy.dylib was not produced by make. Check the Theos build step above."
+            find .theos -type f | head -50 || true
+            exit 1
+          fi
+          echo "Found dylib: $DYLIB"
+          cp "$DYLIB" build/FlameProxy.dylib
+          test -s build/FlameProxy.dylib
+
+      - name: Build .deb (optional, for jailbroken devices)
+        continue-on-error: true
+        run: |
+          mkdir -p output
+          make package FINALPACKAGE=1
+          cp packages/*.deb output/ 2>/dev/null || true
+
+      - name: Upload tweak (dylib + deb)
+        uses: actions/upload-artifact@v5
+        with:
+          name: FlameProxy-tweak
+          path: |
+            build/FlameProxy.dylib
+            output/*.deb
+          if-no-files-found: warn
+
+      # ---------- 2. Get the base app IPA ----------
+      # A Theos project only builds a tweak (.dylib). The TikTok .app itself
+      # cannot be compiled from this repo, so it is taken from the base IPA.
+      - name: Get base IPA
+        run: |
+          set -e
+          mkdir -p build
+          if [ -n "$IPA_URL" ]; then
+            echo "Downloading base IPA from IPA_URL..."
+            curl -L --fail --retry 3 -o build/base.ipa "$IPA_URL"
+          elif [ -f "ipa/app.ipa" ]; then
+            echo "Using ipa/app.ipa from the repo..."
+            cp ipa/app.ipa build/base.ipa
+          elif gh release download base-ipa --repo "${{ github.repository }}" --pattern "*.ipa" --output build/base.ipa --clobber 2>/dev/null; then
+            echo "Using .ipa attached to the base-ipa release..."
+          else
+            echo "::error title=No base IPA::The tweak built fine (see the FlameProxy-tweak artifact), but there is no IPA to inject it into. Do ONE of: (1) set repo variable IPA_URL, (2) run the workflow and fill ipa_url, (3) create a release tagged base-ipa and attach your BHTikTok+ .ipa to it, or (4) commit ipa/app.ipa (Git LFS if over 100 MB)."
+            exit 1
+          fi
+          test -s build/base.ipa
+          ls -lh build/base.ipa
+
+      - name: Verify base IPA and locate .app
+        run: |
+          set -e
+          if head -c 100 build/base.ipa | grep -q "git-lfs"; then
+            echo "::error::base IPA is a Git LFS pointer, not the real file. Use ipa_url or the base-ipa release instead."
+            exit 1
+          fi
+          if ! unzip -tq build/base.ipa >/dev/null 2>&1; then
+            echo "::error::Base IPA is not a valid zip. The link probably returned an HTML page; use a direct download link."
+            head -c 200 build/base.ipa; echo
+            exit 1
+          fi
+          APP=$(unzip -Z1 build/base.ipa | grep -E "^Payload/[^/]+\.app/$" | head -n 1 || true)
+          if [ -z "$APP" ]; then
+            echo "::error::No Payload/<Name>.app found inside the base IPA. Contents:"
+            unzip -Z1 build/base.ipa | head -30
+            exit 1
+          fi
+          echo "Found app bundle in base IPA: $APP"
+
+      # ---------- 3. Inject tweak and package as app.ipa ----------
+      - name: Install injector (cyan)
+        run: |
+          brew install ldid
+          python3 -m pip install --break-system-packages https://github.com/asdfzxcvbn/pyzule-rw/archive/main.zip
+
+      - name: Inject tweak and create app.ipa
+        run: |
+          set -e
+          mkdir -p output
+          rm -f app.ipa
+          cyan -i build/base.ipa -o app.ipa -f build/FlameProxy.dylib
+
+      - name: Verify app.ipa
+        run: |
+          set -e
+          if [ ! -s app.ipa ]; then
+            echo "::error::app.ipa is missing or empty after injection."
+            exit 1
+          fi
+          unzip -tq app.ipa >/dev/null || { echo "::error::app.ipa is not a valid zip."; exit 1; }
+          APP=$(unzip -Z1 app.ipa | grep -E "^Payload/[^/]+\.app/$" | head -n 1 || true)
+          if [ -z "$APP" ]; then
+            echo "::error::Payload/<Name>.app not found in app.ipa."
+            exit 1
+          fi
+          if ! unzip -Z1 app.ipa | grep -qi "flameproxy"; then
+            echo "::error::FlameProxy.dylib is not inside app.ipa, so injection did not work."
+            exit 1
+          fi
+          echo "app.ipa OK, contains $APP and FlameProxy.dylib"
+          ls -lh app.ipa
+
+      - name: Upload app.ipa
+        uses: actions/upload-artifact@v5
+        with:
+          name: app-ipa-unsigned
+          path: app.ipa
+          if-no-files-found: error

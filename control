@@ -1,0 +1,8 @@
+Package: com.example.flameproxy
+Name: FlameProxy
+Version: 0.1.0
+Architecture: iphoneos-arm
+Description: Adds an HTTP proxy button to TikTok
+Maintainer: you
+Author: you
+Section: Tweaks
